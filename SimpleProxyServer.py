@@ -564,7 +564,7 @@ class HttpParser(object):
         return len(data) > 0, data
 
     def finished(self):
-        return self.state == STATE_HTTP_PARSER_DONE
+        return self.parser_type != self.hook.hook_type or self.state == STATE_HTTP_PARSER_DONE
 
     def parse_method(self, data):
         """Parse http method from content."""
