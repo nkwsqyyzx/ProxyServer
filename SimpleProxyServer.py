@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-    SimpleProxyServe.py
+    SimpleProxyServer.py
 
     A Simple HTTP Proxy Server in Python.
     Note:
@@ -59,8 +59,8 @@ STATE_HTTP_PARSER_HEADERS_DONE = 2
 STATE_HTTP_PARSER_HANDLE_BODY = 3
 STATE_HTTP_PARSER_DONE = 4
 
-TYPE_HOOK_CLIENT = 1
-TYPE_HOOK_SERVER = 2
+TYPE_HOOK_CLIENT_DOWN = 1
+TYPE_HOOK_SERVER_UP = 2
 
 
 class ReadWriteHook(object):
@@ -71,38 +71,57 @@ class ReadWriteHook(object):
         self.response_parser = None
 
     def _enable_rewrite(self):
-        if self.hook_type == TYPE_HOOK_CLIENT:
-            return self._enable_rewrite_client(self.request_parser) if self.request_parser else None
-        elif self.hook_type == TYPE_HOOK_SERVER:
-            return self._enable_rewrite_server(self.response_parser) if self.response_parser else None
-        else:
-            return None
+        if self.hook_type == TYPE_HOOK_CLIENT_DOWN:
+            return self._enable_rewrite_server_response(self.request_parser, self.response_parser)
+        elif self.hook_type == TYPE_HOOK_SERVER_UP:
+            return self._enable_rewrite_client_request(self.request_parser, self.response_parser)
+        return None
 
-    def _enable_rewrite_client(self, server_parser):
+    def _enable_rewrite_client_request(self, client_parser, server_parser):
+        """:return self to enable hook"""
         raise NotImplementedError()
 
-    def _enable_rewrite_server(self, client_parser):
+    def _enable_rewrite_server_response(self, client_parser, server_parser):
+        """:return self to enable hook"""
         raise NotImplementedError()
 
-    # noinspection PyMethodMayBeStatic
-    def _rewrite_headers(self, headers):
-        return headers
+    def rewrite_headers(self, headers):
+        raise NotImplementedError()
 
-    # noinspection PyMethodMayBeStatic
-    def _rewrite_body(self, body):
-        return body
+    def rewrite_body(self, body):
+        raise NotImplementedError()
 
     def rebuild(self):
-        origin_parser = self._enable_rewrite()
+        hook = self._enable_rewrite()
+        if hook is None:
+            return None
+
+        if hook.hook_type == TYPE_HOOK_SERVER_UP:
+            origin_parser = self.request_parser
+        else:
+            origin_parser = self.response_parser
 
         if origin_parser:
             arr = []
-            if self.hook_type == TYPE_HOOK_SERVER:
-                arr.append(SPACE.join([origin_parser.version, origin_parser.code, origin_parser.reason]))
-            elif self.hook_type == TYPE_HOOK_CLIENT:
+            if hook.hook_type == TYPE_HOOK_SERVER_UP:
                 arr.append(SPACE.join([origin_parser.method, origin_parser.build_url(), origin_parser.version]))
-            headers = self._rewrite_headers(origin_parser.headers)
-            body = self._rewrite_body(origin_parser.body)
+            elif hook.hook_type == TYPE_HOOK_CLIENT_DOWN:
+                arr.append(SPACE.join([origin_parser.version, origin_parser.code, origin_parser.reason]))
+            headers = hook.rewrite_headers(origin_parser.headers)
+            body = hook.rewrite_body(origin_parser.body)
+            if headers is None:
+                headers = origin_parser.headers
+
+            if body is None:
+                body = origin_parser.body
+            else:
+                if not origin_parser.is_chunk:
+                    try:
+                        (k, _) = headers['content-length']
+                        headers['content-length'] = (k, str(len(body)))
+                    except Exception as e:
+                        log.critical('Response is not chunked but got no Content-Length header:{0}'.format(repr(e)))
+
             for k in headers or {}:
                 arr.append(headers[k][0] + COLON + SPACE + headers[k][1])
             if body:
@@ -117,19 +136,9 @@ class ReadWriteHook(object):
                     arr.append(body)
 
             return CRLF.join(arr)
+        else:
+            log.critical('hook has been enabled but got wrong type of parser')
         return None
-
-
-class HookClientRequestAndServerResponse(ReadWriteHook):
-    def _enable_rewrite_server(self, client_parser):
-        return client_parser
-
-    def _enable_rewrite_client(self, server_parser):
-        return server_parser
-
-    def _rewrite_headers(self, headers):
-        print repr(headers)
-        return headers
 
 
 class ChunkParser(object):
@@ -292,8 +301,8 @@ class Proxy(multiprocessing.Process):
         self.client = client
         self.server = None
 
-        self.request_parser = HttpParser(hook=client_hook)
-        self.response_parser = HttpParser(TYPE_HTTP_PARSER_RESPONSE, hook=server_hook)
+        self.request_parser = HttpParser(hook=server_hook)
+        self.response_parser = HttpParser(TYPE_HTTP_PARSER_RESPONSE, hook=client_hook)
 
         hooks = []
 
@@ -447,7 +456,7 @@ class Proxy(multiprocessing.Process):
     def _process(self):
         while True:
             rlist, wlist, xlist = self._get_waitable_lists()
-            r, w, x = select.select(rlist, wlist, xlist, 3)
+            r, w, x = select.select(rlist, wlist, xlist, 1)
 
             self._process_writing(w)
             if self._process_reading(r):
@@ -627,9 +636,19 @@ def main():
 
     hostname = args.hostname
     port = int(args.port)
+    client_hook = None
+    server_hook = None
+    try:
+        # noinspection PyUnresolvedReferences
+        from hook import CLIENT_HOOK, SERVER_HOOK
+        client_hook = CLIENT_HOOK
+        server_hook = SERVER_HOOK
+    except ImportError as e:
+        log.error("can't import hooks, hooks not found:{0}".format(repr(e)))
+        pass
 
     try:
-        proxy = ProxyServer(hostname, port, 100, server_hook=HookClientRequestAndServerResponse(TYPE_HOOK_SERVER))
+        proxy = ProxyServer(hostname, port, 100, client_hook, server_hook)
         proxy.run()
     except KeyboardInterrupt:
         pass
