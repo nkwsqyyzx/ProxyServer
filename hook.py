@@ -89,7 +89,7 @@ class TestResponseHook(_ClientSideHooks):
     def should_rewrite(self, client_parser, server_parser):
         url = client_parser.url or None
         hostname = url.hostname if url else ''
-        return 'not.https.name' in hostname
+        return 'not.https.name' in (hostname or '')
 
 
 _client_hook = ClientHooks()
