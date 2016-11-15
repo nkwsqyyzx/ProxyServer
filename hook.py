@@ -26,9 +26,9 @@ class _InnerHook(ReadWriteHook):
 
 
 # noinspection PyAbstractClass
-class _ClientSideHooks(_InnerHook):
+class ClientSideHook(_InnerHook):
     def __init__(self):
-        super(_ClientSideHooks, self).__init__(TYPE_HOOK_CLIENT_DOWN)
+        super(ClientSideHook, self).__init__(TYPE_HOOK_CLIENT_DOWN)
 
     def _enable_rewrite_client_request(self, client_parser, server_parser):
         return None
@@ -41,7 +41,7 @@ class _ClientSideHooks(_InnerHook):
         return None
 
 
-class ClientHooks(_ClientSideHooks):
+class _ClientHooks(ClientSideHook):
     def should_rewrite(self, client_parser, server_parser):
         raise Exception('should not call this function')
 
@@ -53,9 +53,9 @@ class ClientHooks(_ClientSideHooks):
 
 
 # noinspection PyAbstractClass
-class _ServerSideHooks(_InnerHook):
+class ServerSideHook(_InnerHook):
     def __init__(self):
-        super(_ServerSideHooks, self).__init__(TYPE_HOOK_SERVER_UP)
+        super(ServerSideHook, self).__init__(TYPE_HOOK_SERVER_UP)
 
     def _enable_rewrite_client_request(self, client_parser, server_parser):
         for hook in self.hooks:
@@ -68,7 +68,7 @@ class _ServerSideHooks(_InnerHook):
         return None
 
 
-class ServerHooks(_ClientSideHooks):
+class _ServerHooks(ServerSideHook):
     def should_rewrite(self, client_parser, server_parser):
         raise Exception('should not call this function')
 
@@ -79,7 +79,7 @@ class ServerHooks(_ClientSideHooks):
         raise Exception('should not call this function')
 
 
-class TestResponseHook(_ClientSideHooks):
+class TestResponseHook(ClientSideHook):
     def rewrite_body(self, body):
         return 'holly shit'
 
@@ -92,9 +92,9 @@ class TestResponseHook(_ClientSideHooks):
         return 'not.https.name' in (hostname or '')
 
 
-_client_hook = ClientHooks()
+_client_hook = _ClientHooks()
 CLIENT_HOOK = _client_hook
-_server_hook = ServerHooks()
+_server_hook = _ServerHooks()
 SERVER_HOOK = _server_hook
 
 
