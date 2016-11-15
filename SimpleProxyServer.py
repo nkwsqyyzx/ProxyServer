@@ -108,12 +108,13 @@ class ReadWriteHook(object):
             elif hook.hook_type == TYPE_HOOK_CLIENT_DOWN:
                 arr.append(SPACE.join([origin_parser.version, origin_parser.code, origin_parser.reason]))
             headers = hook.rewrite_headers(origin_parser.headers)
-            body = hook.rewrite_body(origin_parser.body)
+            origin_body = origin_parser.chunk_parser.body if origin_parser.is_chunk else origin_parser.body
+            body = hook.rewrite_body(origin_body)
             if headers is None:
                 headers = origin_parser.headers
 
             if body is None:
-                body = origin_parser.body
+                body = origin_body
             else:
                 if not origin_parser.is_chunk:
                     try:
@@ -564,7 +565,10 @@ class HttpParser(object):
         return len(data) > 0, data
 
     def finished(self):
-        return self.parser_type != self.hook.hook_type or self.state == STATE_HTTP_PARSER_DONE
+        if self.is_chunk:
+            return self.chunk_parser.state == STATE_CHUNK_PARSER_DONE
+        else:
+            return self.parser_type != self.hook.hook_type or self.state == STATE_HTTP_PARSER_DONE
 
     def parse_method(self, data):
         """Parse http method from content."""
