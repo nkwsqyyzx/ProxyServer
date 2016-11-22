@@ -7,95 +7,125 @@
     :copyright: (c) 2016 by nkwsqyyzx@gmail.com
     :license: BSD, see LICENSE for more details.
 """
+import logging
 
-from SimpleProxyServer import ReadWriteHook
-from SimpleProxyServer import TYPE_HOOK_CLIENT_DOWN, TYPE_HOOK_SERVER_UP
+from constants import *
+
+log = logging.getLogger(__name__)
 
 
-# noinspection PyAbstractClass
-class _InnerHook(ReadWriteHook):
-    def __init__(self, hook_type):
-        super(_InnerHook, self).__init__(hook_type)
+class Context(object):
+    def __init__(self):
+        object.__setattr__(self, '_dict', {})
+
+    def __getattr__(self, item):
+        return self._dict.get(item)
+
+    def __setattr__(self, key, value):
+        self._dict[key] = value
+
+
+class ReadWriteHook(object):
+    def rewrite_client_request(self, client_parser, server_parser):
+        """:return modified client_parser to enable hook"""
+        raise NotImplementedError()
+
+    def rewrite_server_response(self, client_parser, server_parser):
+        """:return modified server_parser to enable hook"""
+        raise NotImplementedError()
+
+    def _respond(self, request_parser, response_parser):
+        if request_parser.context.respond_hook == self:
+            return True
+        v = self.respond(request_parser, response_parser)
+        if v:
+            request_parser.context.respond_hook = self
+        return v
+
+    def respond(self, request_parser, response_parser):
+        raise NotImplementedError()
+
+    def rebuild(self, side, request_parser, response_parser):
+        if side == 0:
+            new_parser = self.rewrite_server_response(request_parser, response_parser)
+        else:
+            new_parser = self.rewrite_client_request(request_parser, response_parser)
+        return ReadWriteHook._rebuild(new_parser) if new_parser else None
+
+    @staticmethod
+    def _rebuild(new_parser):
+        bodies = []
+        arr = []
+        body_type, new_body = new_parser.type_body
+        if new_body:
+            if body_type == TYPE_BODY_CHUNK:
+                bodies.append(hex(len(new_body))[2:])
+                bodies.append(new_body)
+                bodies.append(b'0')
+                bodies.append(CRLF)
+            elif body_type == TYPE_BODY_MULTIPART:
+                boundary = b'--' + new_parser.multipart_parser.boundary
+                names = new_parser.multipart_parser.names
+                # body is a dict with k -> (raw_body, multipart)
+                for k in names:
+                    bodies.append(boundary)
+                    for (_, h) in enumerate(new_body[k][1].headers.items()):
+                        bodies.append(h[0].encode('utf8') + COLON + SPACE + h[1].encode('utf8'))
+                    bodies.append(b'')
+                    bodies.append(new_body[k][0])
+                bodies.append(boundary + b'--')
+                bodies.append('')
+            else:
+                bodies.append(new_body)
+        new_body = CRLF.join(bodies)
+        if not new_parser.is_chunk and new_body:
+            try:
+                (k, _) = new_parser.header_parser.headers[b'content-length']
+                l = len(new_body)
+                if body_type == TYPE_BODY_MULTIPART:
+                    l -= 4
+                new_parser.header_parser.headers[b'content-length'] = (k, str(l))
+            except Exception as e:
+                log.critical(b'Response is not chunked but got no Content-Length header:{0}'.format(repr(e)))
+        arr.append(new_parser.header_parser.build())
+        arr.append(b'')
+        arr.append(new_body)
+        z = CRLF.join(arr)
+        return z
+
+
+class HookChain(object):
+    def __init__(self):
         self.hooks = []
 
     def add_hook(self, hook):
         self.hooks.append(hook)
 
-    def should_rewrite(self, client_parser, server_parser):
-        raise NotImplementedError()
-
-
-# noinspection PyAbstractClass
-class ClientSideHook(_InnerHook):
-    def __init__(self):
-        super(ClientSideHook, self).__init__(TYPE_HOOK_CLIENT_DOWN)
-
-    def _enable_rewrite_client_request(self, client_parser, server_parser):
-        return None
-
-    def _enable_rewrite_server_response(self, client_parser, server_parser):
-        for hook in self.hooks:
-            enable = hook.should_rewrite(client_parser, server_parser)
-            if enable:
+    def respond_hook(self, request_parser, response_parser):
+        for hook in reversed(self.hooks):
+            # noinspection PyProtectedMember
+            if hook._respond(request_parser, response_parser):
                 return hook
         return None
 
 
-class _ClientHooks(ClientSideHook):
-    def should_rewrite(self, client_parser, server_parser):
-        raise Exception('should not call this function')
+class TestResponseHook(ReadWriteHook):
+    def respond(self, request_parser, response_parser):
+        request_header = request_parser.header_parser
+        url = request_header.url or None
+        hostname = url[1] if url else ''
+        return 'your.hostname' == hostname
 
-    def rewrite_body(self, body):
-        raise Exception('should not call this function')
+    def rewrite_server_response(self, client_parser, server_parser):
+        from datetime import datetime
+        server_parser.body = b'holly shit' + b''.join([str(i) for i in reversed(datetime.utcnow().utctimetuple())])
+        return server_parser
 
-    def rewrite_headers(self, headers):
-        raise Exception('should not call this function')
-
-
-# noinspection PyAbstractClass
-class ServerSideHook(_InnerHook):
-    def __init__(self):
-        super(ServerSideHook, self).__init__(TYPE_HOOK_SERVER_UP)
-
-    def _enable_rewrite_client_request(self, client_parser, server_parser):
-        for hook in self.hooks:
-            enable = hook.should_rewrite(client_parser, server_parser)
-            if enable:
-                return hook
-        return None
-
-    def _enable_rewrite_server_response(self, client_parser, server_parser):
+    def rewrite_client_request(self, client_parser, server_parser):
         return None
 
 
-class _ServerHooks(ServerSideHook):
-    def should_rewrite(self, client_parser, server_parser):
-        raise Exception('should not call this function')
+HOOK_CHAIN = HookChain()
 
-    def rewrite_body(self, body):
-        raise Exception('should not call this function')
-
-    def rewrite_headers(self, headers):
-        raise Exception('should not call this function')
-
-
-class TestResponseHook(ClientSideHook):
-    def rewrite_body(self, body):
-        return 'holly shit'
-
-    def rewrite_headers(self, headers):
-        pass
-
-    def should_rewrite(self, client_parser, server_parser):
-        url = client_parser.url or None
-        hostname = url.hostname if url else ''
-        return 'not.https.name' in (hostname or '')
-
-
-_client_hook = _ClientHooks()
-CLIENT_HOOK = _client_hook
-_server_hook = _ServerHooks()
-SERVER_HOOK = _server_hook
-
-
-_client_hook.add_hook(TestResponseHook())
+# Adding to hook chain by call HOOK_CHAIN.add_hook
+# HOOK_CHAIN.add_hook(TestResponseHook())

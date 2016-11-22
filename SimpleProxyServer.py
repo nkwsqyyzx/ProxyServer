@@ -16,19 +16,8 @@ import logging
 import multiprocessing
 import select
 import socket
-import sys
 
-# True if we are running on Python 3.
-PY3 = sys.version_info[0] == 3
-
-if PY3:
-    from urllib import parse as urlparse
-else:
-    import urlparse
-
-CRLF = '\r\n'
-SPACE = ' '
-COLON = ':'
+from parser import HttpParser
 
 log = logging.getLogger(__name__)
 
@@ -37,146 +26,8 @@ class IOException(Exception):
     pass
 
 
-def split(content='', sub=CRLF):
-    index = content.find(sub)
-    return (None, content) if index < 0 else (content[:index], content[index + len(sub):])
-
-
 def now():
     return datetime.datetime.utcnow()
-
-
-STATE_CHUNK_PARSER_INIT = 0
-STATE_CHUNK_PARSER_DATA = 1
-STATE_CHUNK_PARSER_DONE = 2
-
-TYPE_HTTP_PARSER_REQUEST = 1
-TYPE_HTTP_PARSER_RESPONSE = 2
-
-STATE_HTTP_PARSER_INITIALIZED = 0
-STATE_HTTP_PARSER_HANDLE_HEADERS = 1
-STATE_HTTP_PARSER_HEADERS_DONE = 2
-STATE_HTTP_PARSER_HANDLE_BODY = 3
-STATE_HTTP_PARSER_DONE = 4
-
-TYPE_HOOK_CLIENT_DOWN = 1
-TYPE_HOOK_SERVER_UP = 2
-
-
-class ReadWriteHook(object):
-    def __init__(self, hook_type):
-        self.hook_type = hook_type
-        # the original parser will be assigned later
-        self.request_parser = None
-        self.response_parser = None
-
-    def _enable_rewrite(self):
-        if self.hook_type == TYPE_HOOK_CLIENT_DOWN:
-            return self._enable_rewrite_server_response(self.request_parser, self.response_parser)
-        elif self.hook_type == TYPE_HOOK_SERVER_UP:
-            return self._enable_rewrite_client_request(self.request_parser, self.response_parser)
-        return None
-
-    def _enable_rewrite_client_request(self, client_parser, server_parser):
-        """:return self to enable hook"""
-        raise NotImplementedError()
-
-    def _enable_rewrite_server_response(self, client_parser, server_parser):
-        """:return self to enable hook"""
-        raise NotImplementedError()
-
-    def rewrite_headers(self, headers):
-        raise NotImplementedError()
-
-    def rewrite_body(self, body):
-        raise NotImplementedError()
-
-    def rebuild(self):
-        hook = self._enable_rewrite()
-        if hook is None:
-            return None
-
-        if hook.hook_type == TYPE_HOOK_SERVER_UP:
-            origin_parser = self.request_parser
-        else:
-            origin_parser = self.response_parser
-
-        if origin_parser:
-            arr = []
-            if hook.hook_type == TYPE_HOOK_SERVER_UP:
-                arr.append(SPACE.join([origin_parser.method, origin_parser.build_url(), origin_parser.version]))
-            elif hook.hook_type == TYPE_HOOK_CLIENT_DOWN:
-                arr.append(SPACE.join([origin_parser.version, origin_parser.code, origin_parser.reason]))
-            headers = hook.rewrite_headers(origin_parser.headers)
-            origin_body = origin_parser.chunk_parser.body if origin_parser.is_chunk else origin_parser.body
-            body = hook.rewrite_body(origin_body)
-            if headers is None:
-                headers = origin_parser.headers
-
-            if body is None:
-                body = origin_body
-            else:
-                if not origin_parser.is_chunk:
-                    try:
-                        (k, _) = headers['content-length']
-                        headers['content-length'] = (k, str(len(body)))
-                    except Exception as e:
-                        log.critical('Response is not chunked but got no Content-Length header:{0}'.format(repr(e)))
-
-            for k in headers or {}:
-                arr.append(headers[k][0] + COLON + SPACE + headers[k][1])
-            if body:
-                if origin_parser.is_chunk:
-                    arr.append('')
-                    arr.append(hex(len(body))[2:])
-                    arr.append(body)
-                    arr.append('0')
-                    arr.append(CRLF)
-                else:
-                    arr.append('')
-                    arr.append(body)
-
-            return CRLF.join(arr)
-        else:
-            log.critical('hook has been enabled but got wrong type of parser')
-        return None
-
-
-class ChunkParser(object):
-    """Chunked encoding response parser."""
-
-    def __init__(self):
-        self.state = STATE_CHUNK_PARSER_INIT
-        self.body = ''
-        self.chunk = ''
-        self.size = 0
-
-    def parse(self, data):
-        more = len(data) > 0
-        while more:
-            more, data = self.process(data)
-
-    def process(self, data):
-        if self.state == STATE_CHUNK_PARSER_INIT:
-            size, data = split(data)
-            # read chunk size
-            self.size = int(size, 16) if size else 0
-            self.state = STATE_CHUNK_PARSER_DATA
-        elif self.state == STATE_CHUNK_PARSER_DATA:
-            remaining = self.size - len(self.chunk)
-            self.chunk += data[:remaining]
-            data = data[remaining:]
-            if len(self.chunk) == self.size:
-                data = data[len(CRLF):]
-                self.body += self.chunk
-                self.state = STATE_CHUNK_PARSER_INIT if self.size > 0 else STATE_CHUNK_PARSER_DONE
-                self.chunk = ''
-                self.size = 0
-        elif self.state == STATE_CHUNK_PARSER_DONE:
-            pass
-        else:
-            raise IOException('Unexpected state {0}'.format(self.state))
-        return len(data) > 0, data
 
 
 class ConnectionWrapper(object):
@@ -186,8 +37,9 @@ class ConnectionWrapper(object):
         self.connection_type = connection_type
         self.connection = None
         self.closed = False
-        self.buffer = ''
+        self.buffer = b''
         self.has_hook_rebuild = False
+        self.name = datetime.datetime.utcnow().isoformat('_')
 
     def receive(self, size=8192):
         try:
@@ -210,10 +62,14 @@ class ConnectionWrapper(object):
     def queue(self, data):
         self.buffer += data
 
-    def flush(self, parser=None):
-        if parser and parser.hook and not self.has_hook_rebuild:
+    def flush(self, hook=None, side=None, request_parser=None, response_parser=None):
+        if hook and not self.has_hook_rebuild:
             self.has_hook_rebuild = True
-            self.buffer = parser.hook.rebuild() or self.buffer
+            try:
+                new = hook.rebuild(side, request_parser, response_parser)
+                self.buffer = new or self.buffer
+            except Exception as e:
+                log.critical('parser {0} rebuild error:{1}'.format(hook, repr(e)))
 
         sent = self.connection.send(self.buffer)
         self.buffer = self.buffer[sent:]
@@ -275,13 +131,12 @@ class TCPServer(object):
 class ProxyServer(TCPServer):
     """Proxy server implemented with multi processing"""
 
-    def __init__(self, hostname, port, backlog, client_hook=None, server_hook=None):
+    def __init__(self, hostname, port, backlog, hook_chain=None):
         super(ProxyServer, self).__init__(hostname, port, backlog)
-        self.client_hook = client_hook
-        self.server_hook = server_hook
+        self.hook_chain = hook_chain
 
     def handle(self, client):
-        p = Proxy(client, self.client_hook, self.server_hook)
+        p = Proxy(client, self.hook_chain)
         p.daemon = True
         p.start()
         log.debug('Started process {0} to handle connection {1}'.format(p, client.connection))
@@ -293,8 +148,9 @@ class Proxy(multiprocessing.Process):
     Accepts connection object and act as a proxy between client and server.
     """
 
-    def __init__(self, client, client_hook, server_hook):
+    def __init__(self, client, hook_chain):
         super(Proxy, self).__init__()
+        self.context = Context()
 
         self.start_time = now()
         self.last_activity = self.start_time
@@ -302,22 +158,14 @@ class Proxy(multiprocessing.Process):
         self.client = client
         self.server = None
 
-        self.request_parser = HttpParser(hook=server_hook)
-        self.response_parser = HttpParser(TYPE_HTTP_PARSER_RESPONSE, hook=client_hook)
+        self.request_parser = HttpParser()
+        self.response_parser = HttpParser(TYPE_HTTP_PARSER_RESPONSE)
 
-        hooks = []
-
-        if client_hook:
-            hooks.append(client_hook)
-        if server_hook:
-            hooks.append(server_hook)
-        for hook in hooks:
-            hook.request_parser = self.request_parser
-            hook.response_parser = self.response_parser
+        self.hook_chain = hook_chain
 
         self.connection_established_pkt = CRLF.join([
-            'HTTP/1.1 200 Connection established',
-            'Proxy-agent: SimpleProxyServer',
+            b'HTTP/1.1 200 Connection established',
+            b'Proxy-agent: SimpleProxyServer',
             CRLF
         ])
 
@@ -337,17 +185,18 @@ class Proxy(multiprocessing.Process):
 
         # server connection is not ready, parse data and connect to server
         parser.parse(data)
+        header_parser = parser.header_parser
 
         # http request parser has reached the state complete, we attempt to establish connection to destination server
-        if parser.state == STATE_HTTP_PARSER_DONE:
+        if parser.finished():
             log.debug('request parser is in state complete')
 
-            if parser.method == 'CONNECT':
-                host, port = parser.url.path.split(COLON)
-            elif parser.url:
-                host, port = parser.url.hostname, parser.url.port or 80
+            if header_parser.method == b'CONNECT':
+                host, port = header_parser.url.path.split(COLON)
+            elif header_parser.url:
+                host, port = header_parser.url.hostname, header_parser.url.port or 80
             else:
-                raise IOException('Invalid status for proxy, method {0} with no url'.format(parser.method))
+                raise IOException('Invalid status for proxy, method {0} with no url'.format(header_parser.method))
 
             self.server = Server(host, port)
             try:
@@ -360,66 +209,60 @@ class Proxy(multiprocessing.Process):
 
             # for http connect methods (https requests) queue appropriate response for client
             # and also notifying about established connection
-            if parser.method == 'CONNECT':
+            if header_parser.method == b'CONNECT':
                 self.client.queue(self.connection_established_pkt)
             # for usual http requests, re-build request packet and queue for the server with appropriate headers
             else:
-                del_headers = ['proxy-connection', 'connection', 'keep-alive']
-                add_headers = [('Connection', 'Close')]
-                self.server.queue(parser.build_request(del_headers=del_headers, add_headers=add_headers))
+                self.server.queue(parser.build_request())
 
     def on_server_side_incoming(self, data):
         # parse incoming response packet only for non-https requests
-        if not self.request_parser.method == 'CONNECT':
+        if not self.request_parser.header_parser.method == b'CONNECT':
             self.response_parser.parse(data)
 
         # queue data for client
         self.client.queue(data)
 
     def _access_log(self):
-        parser = self.request_parser
+        request_header_parser = self.request_parser.header_parser
+        response_header_parser = self.response_parser.header_parser
         host, port = self.server.address if self.server else (None, None)
-        if parser.method == 'CONNECT':
-            msg = '%s:%s - %s %s:%s' % (self.client.address[0], self.client.address[1], parser.method, host, port)
+        if request_header_parser.method == b'CONNECT':
+            msg = '%s:%s - %s %s:%s' % (self.client.address[0], self.client.address[1], b'CONNECT', host, port)
             log.info(msg)
-        elif parser.method:
+        elif request_header_parser.method:
             log.info('%s:%s - %s %s:%s%s - %s %s - %s bytes' % (
-                self.client.address[0], self.client.address[1], parser.method, host, port,
-                parser.build_url(),
-                self.response_parser.code, self.response_parser.reason, len(self.response_parser.raw)))
+                self.client.address[0], self.client.address[1], request_header_parser.method, host, port,
+                request_header_parser.url,
+                response_header_parser.code, response_header_parser.reason, len(self.response_parser.raw)))
 
     def _get_waitable_lists(self):
         rlist, wlist, xlist = [self.client.connection], [], []
-        log.debug('*** watching client for read ready')
 
         if self.client.has_buffer():
-            log.debug('pending client buffer found, watching client for write ready')
             wlist.append(self.client.connection)
 
         if self.server and not self.server.closed:
-            log.debug('connection to server exists, watching server for read ready')
             rlist.append(self.server.connection)
 
         if self.server and not self.server.closed and self.server.has_buffer():
-            log.debug('connection to server exists and pending server buffer found, watching server for write ready')
             wlist.append(self.server.connection)
 
         return rlist, wlist, xlist
 
     def _process_writing(self, w):
+        hc = self.hook_chain if self.request_parser.finished() else None
+        hook = hc.respond_hook(self.request_parser, self.response_parser) if hc else None
         server_side_finished = self.response_parser.finished()
         if server_side_finished and self.client.connection in w:
-            log.debug('client is ready for writes, flushing client buffer')
-            self.client.flush(self.response_parser)
+            self.client.flush(hook, 0, self.request_parser, self.response_parser)
 
         client_side_finished = self.request_parser.finished()
         if client_side_finished and self.server and not self.server.closed and self.server.connection in w:
-            log.debug('server is ready for writes, flushing server buffer')
-            self.server.flush(self.request_parser)
+            self.server.flush(hook, 1, self.request_parser, self.response_parser)
 
     def _process_reading(self, r):
         if self.client.connection in r:
-            log.debug('client is ready for reads, reading')
             data = self.client.receive()
             self.last_activity = now()
 
@@ -432,17 +275,16 @@ class Proxy(multiprocessing.Process):
             except IOException as e:
                 log.exception(e)
                 self.client.queue(CRLF.join([
-                    'HTTP/1.1 502 Bad Gateway',
-                    'Proxy-agent: SimpleProxyServer',
-                    'Content-Length: 11',
-                    'Connection: close',
+                    b'HTTP/1.1 502 Bad Gateway',
+                    b'Proxy-agent: SimpleProxyServer',
+                    b'Content-Length: 11',
+                    b'Connection: close',
                     CRLF
-                ]) + 'Bad Gateway')
+                ]) + b'Bad Gateway')
                 self.client.flush()
                 return True
 
         if self.server and not self.server.closed and self.server.connection in r:
-            log.debug('server is ready for reads, reading')
             data = self.server.receive()
             self.last_activity = now()
 
@@ -464,7 +306,7 @@ class Proxy(multiprocessing.Process):
                 break
 
             if self.client.buffer_size() == 0:
-                if self.response_parser.state == STATE_HTTP_PARSER_DONE:
+                if self.response_parser.finished():
                     log.debug('client buffer is empty and response state is complete, breaking')
                     break
 
@@ -492,139 +334,6 @@ class Proxy(multiprocessing.Process):
                 'Closing proxy for connection %r at address %r' % (self.client.connection, self.client.address))
 
 
-class HttpParser(object):
-    """HTTP request/response parser."""
-
-    def __init__(self, parser_type=TYPE_HTTP_PARSER_REQUEST, hook=None):
-        self.state = STATE_HTTP_PARSER_INITIALIZED
-        self.parser_type = parser_type
-
-        self.raw = ''
-        self.buffer = ''
-
-        self.headers = dict()
-        self.body = None
-
-        self.method = None
-        self.url = None
-        self.code = None
-        self.reason = None
-        self.version = None
-
-        self.chunk_parser = ChunkParser()
-        self.is_chunk = False
-        self.hook = hook
-
-    def parse(self, data):
-        self.raw += data
-        data = self.buffer + data
-        self.buffer = ''
-
-        more = True if len(data) > 0 else False
-        while more:
-            more, data = self.process(data)
-        self.buffer = data
-
-    def _post_or_response(self):
-        return self.method == 'POST' or self.parser_type == TYPE_HTTP_PARSER_RESPONSE
-
-    def _get_and_request(self):
-        return not self.method == 'POST' and self.parser_type == TYPE_HTTP_PARSER_REQUEST
-
-    def process(self, data):
-        if self.state >= STATE_HTTP_PARSER_HEADERS_DONE and self._post_or_response():
-            if not self.body:
-                self.body = ''
-
-            if 'content-length' in self.headers:
-                self.state = STATE_HTTP_PARSER_HANDLE_BODY
-                self.body += data
-                if len(self.body) >= int(self.headers['content-length'][1]):
-                    self.state = STATE_HTTP_PARSER_DONE
-            elif 'transfer-encoding' in self.headers and self.headers['transfer-encoding'][1].lower() == 'chunked':
-                self.is_chunk = True
-                self.chunk_parser.parse(data)
-                if self.chunk_parser.state == STATE_CHUNK_PARSER_DONE:
-                    self.body = self.chunk_parser.body
-                    self.state = STATE_HTTP_PARSER_DONE
-
-            return False, ''
-
-        line, data = split(data)
-        if line is None:
-            return line, data
-
-        if self.state == STATE_HTTP_PARSER_INITIALIZED:
-            self.parse_method(line)
-        elif self.state < STATE_HTTP_PARSER_HEADERS_DONE:
-            self.parse_header(line)
-
-        if self.state == STATE_HTTP_PARSER_HEADERS_DONE and self._get_and_request() and self.raw.endswith(CRLF * 2):
-            self.state = STATE_HTTP_PARSER_DONE
-
-        return len(data) > 0, data
-
-    def finished(self):
-        if self.is_chunk:
-            return self.chunk_parser.state == STATE_CHUNK_PARSER_DONE
-        else:
-            return self.parser_type != self.hook.hook_type or self.state == STATE_HTTP_PARSER_DONE
-
-    def parse_method(self, data):
-        """Parse http method from content."""
-        # read first line
-        line = data.split(SPACE)
-        if self.parser_type == TYPE_HTTP_PARSER_REQUEST:
-            self.method = line[0].upper()
-            self.url = urlparse.urlsplit(line[1])
-            self.version = line[2]
-        else:
-            self.version = line[0]
-            self.code = line[1]
-            self.reason = ' '.join(line[2:])
-        self.state = STATE_HTTP_PARSER_HANDLE_HEADERS
-
-    def parse_header(self, data):
-        if len(data) == 0:
-            if self.state == STATE_HTTP_PARSER_HANDLE_HEADERS:
-                self.state = STATE_HTTP_PARSER_HEADERS_DONE
-        else:
-            self.state = STATE_HTTP_PARSER_HANDLE_HEADERS
-            parts = data.split(COLON)
-            key = parts[0].strip()
-            value = COLON.join(parts[1:]).strip()
-            self.headers[key.lower()] = (key, value)
-
-    def build_url(self):
-        if not self.url:
-            return '/None'
-
-        url = self.url.path
-        if url == '':
-            url = '/'
-        if not self.url.query == '':
-            url += '?' + self.url.query
-        if not self.url.fragment == '':
-            url += '#' + self.url.fragment
-        return url
-
-    def build_request(self, del_headers=None, add_headers=None):
-        arr = [' '.join([self.method, self.build_url(), self.version])]
-
-        for k in self.headers:
-            if k not in del_headers or []:
-                arr.append(self.headers[k][0] + COLON + SPACE + self.headers[k][1])
-
-        for k in add_headers or []:
-            arr.append(k[0] + COLON + SPACE + k[1])
-
-        arr.append(CRLF)
-        if self.body:
-            arr.append(self.body)
-
-        return CRLF.join(arr)
-
-
 def main():
     parser = argparse.ArgumentParser(
         description='SimpleProxyServer.py',
@@ -640,19 +349,17 @@ def main():
 
     hostname = args.hostname
     port = int(args.port)
-    client_hook = None
-    server_hook = None
+    hook_chain = None
     try:
         # noinspection PyUnresolvedReferences
-        from hook import CLIENT_HOOK, SERVER_HOOK
-        client_hook = CLIENT_HOOK
-        server_hook = SERVER_HOOK
+        from hook import HOOK_CHAIN
+        hook_chain = HOOK_CHAIN
     except ImportError as e:
-        log.error("can't import hooks, hooks not found:{0}".format(repr(e)))
+        log.error("can't import hooks, error:{0}".format(repr(e)))
         pass
 
     try:
-        proxy = ProxyServer(hostname, port, 100, client_hook, server_hook)
+        proxy = ProxyServer(hostname, port, 100, hook_chain=hook_chain)
         proxy.run()
     except KeyboardInterrupt:
         pass
