@@ -17,6 +17,8 @@ import multiprocessing
 import select
 import socket
 
+from constants import TYPE_HTTP_PARSER_RESPONSE, CRLF, COLON
+from hook import Context
 from parser import HttpParser
 
 log = logging.getLogger(__name__)
