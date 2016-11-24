@@ -170,6 +170,7 @@ class Proxy(multiprocessing.Process):
             b'Proxy-agent: SimpleProxyServer',
             CRLF
         ])
+        self.is_https = False
 
     def _inactive_for(self):
         return (now() - self.last_activity).seconds
@@ -194,6 +195,7 @@ class Proxy(multiprocessing.Process):
             log.debug('request parser is in state complete')
 
             if header_parser.method == b'CONNECT':
+                self.is_https = True
                 host, port = header_parser.url.path.split(COLON)
             elif header_parser.url:
                 host, port = header_parser.url.hostname, header_parser.url.port or 80
@@ -219,7 +221,7 @@ class Proxy(multiprocessing.Process):
 
     def on_server_side_incoming(self, data):
         # parse incoming response packet only for non-https requests
-        if not self.request_parser.header_parser.method == b'CONNECT':
+        if not self.is_https:
             self.response_parser.parse(data)
 
         # queue data for client
@@ -255,11 +257,11 @@ class Proxy(multiprocessing.Process):
     def _process_writing(self, w):
         hc = self.hook_chain if self.request_parser.finished() else None
         hook = hc.respond_hook(self.request_parser, self.response_parser) if hc else None
-        server_side_finished = self.response_parser.finished()
+        server_side_finished = self.is_https or self.response_parser.finished()
         if server_side_finished and self.client.connection in w:
             self.client.flush(hook, 0, self.request_parser, self.response_parser)
 
-        client_side_finished = self.request_parser.finished()
+        client_side_finished = self.is_https or self.request_parser.finished()
         if client_side_finished and self.server and not self.server.closed and self.server.connection in w:
             self.server.flush(hook, 1, self.request_parser, self.response_parser)
 

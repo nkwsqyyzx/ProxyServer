@@ -164,6 +164,8 @@ class HeaderParser(_Parser):
         self.reason = None
         self.version = None
 
+        self.is_https = False
+
     def _parse_first_line(self, data):
         line = data.split(SPACE)
         if len(line) < 3:
@@ -173,6 +175,7 @@ class HeaderParser(_Parser):
             self.method = line[0].upper()
             self.url = urlparse.urlsplit(line[1])
             self.version = line[2]
+            self.is_https = self.method == b'CONNECT'
         else:
             self.version = line[0]
             self.code = line[1]
@@ -386,7 +389,8 @@ class HttpParser(object):
         return len(data) > 0, data
 
     def finished(self):
-        return self.chunk_parser.is_done if self.is_chunk else self._state == STATE_HTTP_PARSER_DONE
+        return self.header_parser.is_https or \
+               self.chunk_parser.is_done if self.is_chunk else self._state == STATE_HTTP_PARSER_DONE
 
     def build_request(self):
         arr = [self.header_parser.build(), CRLF]
