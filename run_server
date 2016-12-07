@@ -1,0 +1,33 @@
+#! /bin/sh
+
+SCR_DIR=$(dirname $0)
+cd $SCR_DIR
+
+start() {
+    python SimpleProxyServer.py --hostname=0.0.0.0 >>"$(date +%Y%m%d_%H)" 2>&1
+    echo -n "Start SimpleProxyServer Success!";
+    echo "";
+}
+
+stop() {
+    ps ux|grep python|grep SimpleProxyServer.py|awk '{print $2}'|while read -r pid;do (echo "killing $pid" && kill $pid);done
+    echo -n "Stop SimpleProxyServer Success!";
+    echo "";
+}
+
+restart() {
+    stop
+    start
+}
+
+case C"$1" in
+    Cstop)
+        stop
+        ;;
+    Crestart)
+        restart
+        ;;
+    C*)
+        echo "Usage: $0 {stop|restart}"
+        ;;
+esac
